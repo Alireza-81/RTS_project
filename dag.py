@@ -1,32 +1,16 @@
-"""Phase 1 + Scheduler – DAG modelling **and** robustness‑aware scheduling
-====================================================================
-This single file now covers two layers:
-
-* **Modelling layer** – generate DAG task‑sets and a multi‑core platform (Phase 1).
-* **Scheduling layer** – robust, network‑vulnerability‑aware list scheduler (Phase 2).
-
-Python ≥ 3.8 compatible (no PEP 604 syntax).
-"""
-
 from __future__ import annotations
-
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Tuple, Optional, Any
 import heapq
 import json
 import random
-
 import networkx as nx
-
-# ==========================================================================
-# Core domain classes
-# ==========================================================================
 
 @dataclass
 class Task:
     id: int
-    workload: float  # abstract CPU‑time units
-    deadline: float  # absolute time by which task should finish
+    workload: float 
+    deadline: float
     resources: Dict[str, int]
 
     def to_dict(self) -> Dict[str, Any]:
@@ -36,7 +20,7 @@ class Task:
 @dataclass
 class Core:
     id: int
-    speed: float = 1.0  # relative factor – duration = workload / speed
+    speed: float = 1.0
 
 
 @dataclass
@@ -49,7 +33,6 @@ class System:
 
 @dataclass
 class ScheduledTask:
-    """Result of the scheduler – when and where a task executes."""
     task_id: int
     core_id: int
     start: float
@@ -57,20 +40,75 @@ class ScheduledTask:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+    
 
+######### Graphs from scratch
 
-# ==========================================================================
-# Phase 1 – synthetic DAG and platform generation helpers
-# ==========================================================================
-
-def generate_dag(num_nodes: int,
-                 model: str = "erdos_renyi",
-                 seed: Optional[int] = None,
-                 **kwargs) -> nx.DiGraph:
-    """Return an *acyclic* digraph following the requested topology."""
+def erdos_renyi_graph_scratch(n: int, p: float, seed: Optional[int] = None) -> nx.Graph:
     rng = random.Random(seed)
+    g = nx.Graph()
+    g.add_nodes_from(range(n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            if rng.random() < p:
+                g.add_edge(i, j)
+    return g
 
-    # Base undirected graph
+
+def barabasi_albert_graph_scratch(n: int, m: int = 2, seed: Optional[int] = None) -> nx.Graph:
+    if m < 1 or m >= n:
+        raise ValueError("1 <= m < n")
+    rng = random.Random(seed)
+    g = nx.Graph()
+    g.add_nodes_from(range(n))
+    for i in range(m):
+        for j in range(i + 1, m):
+            g.add_edge(i, j)
+
+    repeated_nodes = []
+    for node in range(m):
+        repeated_nodes.extend([node] * g.degree(node))
+
+    for new_node in range(m, n):
+        targets = set()
+        while len(targets) < m:
+            chosen = rng.choice(repeated_nodes)
+            targets.add(chosen)
+
+        for t in targets:
+            g.add_edge(new_node, t)
+        repeated_nodes.extend(list(targets))
+        repeated_nodes.extend([new_node] * m)
+
+    return g
+
+def watts_strogatz_graph_scratch(n: int, k: int = 4, p: float = 0.1,
+                                 seed: Optional[int] = None) -> nx.Graph:
+    if k % 2 != 0:
+        raise ValueError("k even")
+    rng = random.Random(seed)
+    g = nx.Graph()
+    g.add_nodes_from(range(n))
+
+    for i in range(n):
+        for j in range(1, k // 2 + 1):
+            g.add_edge(i, (i + j) % n)
+
+    for u, v in list(g.edges()):
+        if rng.random() < p:
+            possible = set(range(n)) - {u} - set(g.neighbors(u))
+            if possible:
+                w = rng.choice(list(possible))
+                g.remove_edge(u, v)
+                g.add_edge(u, w)
+
+    return g
+
+
+
+
+def generate_dag(num_nodes: int, model: str = "erdos_renyi", seed: Optional[int] = None, **kwargs) -> nx.DiGraph:
+    rng = random.Random(seed)
     if model == "erdos_renyi":
         p = kwargs.get("p", min(0.5, 3 / num_nodes))
         base = nx.erdos_renyi_graph(num_nodes, p, seed=seed)
@@ -82,9 +120,8 @@ def generate_dag(num_nodes: int,
         p = kwargs.get("p", 0.1)
         base = nx.watts_strogatz_graph(num_nodes, k, p, seed=seed)
     else:
-        raise ValueError(f"Unsupported model '{model}'.")
+        return "no correct model chosen!"
 
-    # Orient undirected edges according to random rank → guarantees DAG
     order = list(base.nodes())
     rng.shuffle(order)
     rank = {n: i for i, n in enumerate(order)}
@@ -131,15 +168,10 @@ def build_system(num_cores: int = 4, heterogeneity: bool = False, seed: Optional
     return System(cores)
 
 
-# ==========================================================================
-# Phase 2 – Vulnerability metrics & robust scheduler
-# ==========================================================================
-
 def compute_vulnerability_scores(dag: nx.DiGraph,
                                  w_degree: float = 0.4,
                                  w_between: float = 0.4,
                                  w_kcore: float = 0.2) -> Dict[int, float]:
-    """Return a composite vulnerability score per node in *[0,1]*."""
     deg = nx.degree_centrality(dag)                # already 0‑1
     bet = nx.betweenness_centrality(dag, normalized=True)  # 0‑1
     kcore = nx.core_number(dag)                    # integer ≥1, scale later
@@ -151,14 +183,11 @@ def compute_vulnerability_scores(dag: nx.DiGraph,
         score[v] = w_degree * deg[v] + w_between * bet[v] + w_kcore * k_scaled
     return score
 
-
-def robust_list_schedule(dag: nx.DiGraph, system: System,
-                         vuln_score: Optional[Dict[int, float]] = None) -> List[ScheduledTask]:
-    """A simple non‑preemptive list scheduler prioritising high‑vulnerability tasks."""
+## Attempt to try phase 2
+def robust_list_schedule(dag: nx.DiGraph, system: System, vuln_score: Optional[Dict[int, float]] = None) -> List[ScheduledTask]:
     if vuln_score is None:
         vuln_score = compute_vulnerability_scores(dag)
 
-    # Priority key: higher vulnerability first, then earlier deadline
     def priority(node: int) -> Tuple[float, float]:
         t: Task = dag.nodes[node]["task"]
         return (-vuln_score[node], t.deadline)
@@ -167,30 +196,27 @@ def robust_list_schedule(dag: nx.DiGraph, system: System,
     heap: List[Tuple[Tuple[float, float], int]] = [(priority(n), n) for n in ready]
     heapq.heapify(heap)
 
-    core_free_at = [0.0 for _ in system.cores]  # time when each core becomes free
-    running: List[Tuple[float, int, ScheduledTask]] = []  # (finish, core_id, sched)
+    core_free_at = [0.0 for _ in system.cores] 
+    running: List[Tuple[float, int, ScheduledTask]] = []
     schedule: List[ScheduledTask] = []
     current_time = 0.0
 
     completed: set[int] = set()
 
     while heap or running:
-        # Assign ready tasks to newly free cores
-        # Free any cores finishing now or earlier
-        running.sort()  # ensure earliest finish first
+        running.sort() 
         while running and running[0][0] <= current_time:
             finish, cid, st = running.pop(0)
             schedule.append(st)
             completed.add(st.task_id)
             core_free_at[cid] = finish
-            # Unlock successors
+ 
             for succ in dag.successors(st.task_id):
                 if succ in completed:
-                    continue  # already done (shouldn't happen)
+                    continue 
                 if all(pred in completed for pred in dag.predecessors(succ)):
                     heapq.heappush(heap, (priority(succ), succ))
 
-        # If cores are idle and tasks await → dispatch
         idle_cores = [i for i, t_free in enumerate(core_free_at) if t_free <= current_time]
         while idle_cores and heap:
             _, node = heapq.heappop(heap)
@@ -202,18 +228,13 @@ def robust_list_schedule(dag: nx.DiGraph, system: System,
             running.append((finish, core_id, st))
             core_free_at[core_id] = finish
 
-        # Advance time: to earliest finishing task or next ready task release
         if running:
             current_time = min(f for f, _, _ in running)
-        elif heap:  # tasks ready but all cores busy – shouldn’t happen here
-            current_time += 0.001  # tiny step
+        elif heap: 
+            current_time += 0.001  
 
     return schedule
 
-
-# ==========================================================================
-# Utility – export / CLI
-# ==========================================================================
 
 def export_schedule_to_json(schedule: List[ScheduledTask], path: str) -> None:
     with open(path, "w", encoding="utf-8") as fh:
@@ -229,14 +250,10 @@ def export_dag_to_json(dag: nx.DiGraph, path: str) -> None:
         json.dump(data, fh, indent=2)
 
 
-# -----------------------------
-# Quick‑start CLI
-# -----------------------------
-
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Phase 1+2 – DAG generator and robust scheduler")
+    parser = argparse.ArgumentParser()
     parser.add_argument("--nodes", type=int, default=15, help="Number of tasks (nodes)")
     parser.add_argument("--model", type=str, default="erdos_renyi",
                         choices=["erdos_renyi", "scale_free", "small_world"],
@@ -245,7 +262,7 @@ if __name__ == "__main__":
     parser.add_argument("--hetero", action="store_true", help="Use heterogeneous core speeds")
     parser.add_argument("--out-dag", type=str, default="dag.json", help="Output DAG JSON path")
     parser.add_argument("--out-sched", type=str, default="schedule.json", help="Output schedule JSON")
-    parser.add_argument("--seed", type=int, default=None, help="Random seed")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
     dag = generate_dag(args.nodes, model=args.model, seed=args.seed)
@@ -258,5 +275,4 @@ if __name__ == "__main__":
     export_schedule_to_json(schedule, args.out_sched)
 
     makespan = max(st.finish for st in schedule)
-    print(f"✓ DAG exported to {args.out_dag}  ({dag.number_of_nodes()} tasks)")
-    print(f"✓ Schedule exported to {args.out_sched} — makespan ≈ {makespan:.1f} time‑units")
+    print(f"makespan = {makespan:.1f} time‑units")
